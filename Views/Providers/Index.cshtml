@@ -1,0 +1,51 @@
+﻿@using LiveDahsboard.Models
+@model IEnumerable<ExternalProvider>
+@{
+    ViewBag.Title = "External Providers";
+}
+
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem">
+    <h2>External Providers — @ViewBag.CompanyId</h2>
+    <a asp-action="Create" class="btn btn-primary">+ New</a>
+</div>
+
+<table class="table">
+    <thead><tr><th>Username</th><th>Company</th><th>Starts</th><th>Expires</th><th>Status</th><th></th></tr></thead>
+    <tbody>
+        @foreach (var p in Model)
+        {
+            <tr>
+                <td><code>@p.Username</code></td>
+                <td>@p.CompanyId</td>
+                <td>@p.StartsAt.ToString("yyyy-MM-dd")</td>
+                <td>@p.ExpiresAt.ToString("yyyy-MM-dd")</td>
+                <td>
+                    @if (p.IsValid)
+                    {
+                        <span class="badge bg-success">Valid</span>
+                    }
+                    else if (DateTime.UtcNow < p.StartsAt)
+                    {
+
+                        <span class="badge bg-secondary">Pending</span>
+                    }
+                    else
+                    {
+
+                        <span class="badge bg-danger">Expired</span>
+                    }
+                </td>
+                <td>
+                    <form method="post" asp-action="Delete" style="display:inline">
+                        <input type="hidden" name="id" value="@p.Id" />
+                        <input type="hidden" name="companyId" value="@p.CompanyId" />
+                        <button class="btn btn-sm btn-outline-danger"
+                                onclick="return confirm('Delete?')">
+                            Delete
+                        </button>
+                    </form>
+                </td>
+            </tr>
+        }
+    </tbody>
+</table>

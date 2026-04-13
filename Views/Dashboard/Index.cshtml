@@ -1,0 +1,51 @@
+﻿@using LiveDahsboard.DTOs
+@model IEnumerable<CompanyDayStats>
+@{
+    ViewBag.Title = "Dashboard";
+    var companyId = ViewBag.CompanyId as string;
+}
+
+<h2>@companyId — last @ViewBag.Days days</h2>
+
+<form method="get" style="margin-bottom:1rem;display:flex;gap:.5rem;align-items:center">
+    <input name="companyId" value="@companyId" placeholder="Company ID" class="form-control" style="width:160px" />
+    <select name="days" class="form-control" style="width:100px">
+        @foreach (var d in new[] { 7, 14, 30, 60 })
+        {
+            <option value="@d" selected="@(ViewBag.Days == d)">@d days</option>
+        }
+    </select>
+    <button class="btn btn-primary">Apply</button>
+</form>
+
+@if (!Model.Any())
+{
+    <p>No data found.</p>
+}
+else
+{
+    <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:1rem;margin-bottom:2rem">
+        @{ var totals = Model.ToList(); }
+        <div class="card p-3"><div class="text-muted small">Total Riders</div><div class="fs-4 fw-bold">@totals.Sum(s=>s.TotalRiders)</div></div>
+        <div class="card p-3"><div class="text-muted small">Total Orders</div><div class="fs-4 fw-bold">@totals.Sum(s=>s.TotalOrders)</div></div>
+        <div class="card p-3"><div class="text-muted small">Total Wallet</div><div class="fs-4 fw-bold">@totals.Sum(s=>s.TotalWallet).ToString("N2")</div></div>
+        <div class="card p-3"><div class="text-muted small">Total Hours</div><div class="fs-4 fw-bold">@totals.Sum(s=>s.TotalWorkingHours).ToString("N1")</div></div>
+    </div>
+
+    <table class="table table-hover">
+        <thead><tr><th>Date</th><th>Riders</th><th>Orders</th><th>Wallet</th><th>Hours</th><th></th></tr></thead>
+        <tbody>
+        @foreach (var s in Model)
+        {
+            <tr>
+                <td>@s.Date</td>
+                <td>@s.TotalRiders</td>
+                <td>@s.TotalOrders</td>
+                <td>@s.TotalWallet.ToString("N2")</td>
+                <td>@s.TotalWorkingHours.ToString("N1")</td>
+                <td><a asp-action="Day" asp-route-companyId="@companyId" asp-route-date="@s.Date">Details</a></td>
+            </tr>
+        }
+        </tbody>
+    </table>
+}

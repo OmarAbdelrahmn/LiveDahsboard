@@ -1,0 +1,31 @@
+﻿@using LiveDahsboard.DTOs
+@model CompanyDayStats
+@{
+    ViewBag.Title = $"{Model.CompanyId} — {Model.Date}";
+}
+
+<a asp-action="Index" asp-route-companyId="@Model.CompanyId">← Back</a>
+<h2>@Model.CompanyId — @Model.Date</h2>
+
+<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:1rem;margin-bottom:1.5rem">
+    <div class="card p-3"><div class="text-muted small">Riders</div><div class="fs-5 fw-bold">@Model.TotalRiders</div></div>
+    <div class="card p-3"><div class="text-muted small">Orders</div><div class="fs-5 fw-bold">@Model.TotalOrders</div></div>
+    <div class="card p-3"><div class="text-muted small">Wallet</div><div class="fs-5 fw-bold">@Model.TotalWallet.ToString("N2")</div></div>
+    <div class="card p-3"><div class="text-muted small">Hours</div><div class="fs-5 fw-bold">@Model.TotalWorkingHours.ToString("N1")</div></div>
+</div>
+
+<table class="table">
+    <thead><tr><th>Rider ID</th><th>Name</th><th>Orders</th><th>Wallet</th><th>Hours</th></tr></thead>
+    <tbody>
+        @foreach (var r in Model.Riders)
+        {
+            <tr>
+                <td>@r.RiderId</td>
+                <td>@r.RiderName</td>
+                <td>@r.Orders</td>
+                <td>@r.Wallet.ToString("N2")</td>
+                <td>@r.WorkingHours.ToString("N1")</td>
+            </tr>
+        }
+    </tbody>
+</table>
