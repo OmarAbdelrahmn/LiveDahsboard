@@ -7,15 +7,9 @@ namespace LiveDahsboard.Services;
 
 public class ExternalProviderService(ApplicationDbContext db) : IExternalProviderService
 {
-    public async Task<ExternalProvider> CreateAsync(string companyId, string username, DateTime startsAt, DateTime expiresAt)
+    public async Task<ExternalProvider> CreateAsync(string username, DateTime startsAt, DateTime expiresAt)
     {
-        var provider = new ExternalProvider
-        {
-            CompanyId = companyId,
-            Username = username,
-            StartsAt = startsAt,
-            ExpiresAt = expiresAt
-        };
+        var provider = new ExternalProvider { Username = username, StartsAt = startsAt, ExpiresAt = expiresAt };
         db.ExternalProviders.Add(provider);
         await db.SaveChangesAsync();
         return provider;
@@ -23,22 +17,16 @@ public class ExternalProviderService(ApplicationDbContext db) : IExternalProvide
 
     public async Task<bool?> IsValidAsync(string username)
     {
-        var p = await db.ExternalProviders
-            .AsNoTracking()
-            .FirstOrDefaultAsync(x => x.Username == username);
-
+        var p = await db.ExternalProviders.AsNoTracking()
+                        .FirstOrDefaultAsync(x => x.Username == username);
         return p is null ? null : p.IsValid;
     }
 
-    public async Task<IEnumerable<ExternalProvider>> GetByCompanyAsync(string companyId) =>
-        await db.ExternalProviders
-            .AsNoTracking()
-            .Where(p => p.CompanyId == companyId)
-            .OrderByDescending(p => p.ExpiresAt)
-            .ToListAsync();
+    public async Task<IEnumerable<ExternalProvider>> GetAllAsync() =>
+        await db.ExternalProviders.AsNoTracking()
+                .OrderByDescending(p => p.ExpiresAt)
+                .ToListAsync();
 
-    public async Task DeleteAsync(int id)
-    {
+    public async Task DeleteAsync(int id) =>
         await db.ExternalProviders.Where(p => p.Id == id).ExecuteDeleteAsync();
-    }
 }

@@ -13,8 +13,6 @@ public class ExternalProvider
     [Required, MaxLength(100)]
     public string Username { get; set; } = null!;
 
-    [Required, MaxLength(50)]
-    public string CompanyId { get; set; } = null!;
 
     public DateTime StartsAt { get; set; }
     public DateTime ExpiresAt { get; set; }

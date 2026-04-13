@@ -28,6 +28,18 @@
                         </li>
                     </ul>
 
+                    <div class="navbar-nav me-auto">
+                        <a class="nav-link @(ViewContext.RouteData.Values["controller"]?.ToString() == "Dashboard" ? "active" : "")"
+                               asp-controller="Dashboard" asp-action="Index">
+                            Dashboard
+                        </a>
+                        <a class="nav-link @(ViewContext.RouteData.Values["controller"]?.ToString() == "Providers" ? "active" : "")"
+                               asp-controller="Providers" asp-action="Index">
+                            Providers
+                        </a>
+                    </div>
+
+
                     @if (User.Identity?.IsAuthenticated == true)
                     {
                         <span class="navbar-text me-3">@User.Identity.Name</span>

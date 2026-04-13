@@ -4,14 +4,12 @@ using Microsoft.AspNetCore.Mvc;
 
 namespace LiveDahsboard.Controllers;
 
-
 [Authorize]
 public class ProvidersController(IExternalProviderService service) : Controller
 {
-    public async Task<IActionResult> Index(string companyId = "default")
+    public async Task<IActionResult> Index()
     {
-        var providers = await service.GetByCompanyAsync(companyId);
-        ViewBag.CompanyId = companyId;
+        var providers = await service.GetAllAsync();
         return View(providers);
     }
 
@@ -19,17 +17,17 @@ public class ProvidersController(IExternalProviderService service) : Controller
     public IActionResult Create() => View();
 
     [HttpPost]
-    public async Task<IActionResult> Create(string companyId, string username,
-        DateTime startsAt, DateTime expiresAt)
+    public async Task<IActionResult> Create(string username, DateTime startsAt, DateTime expiresAt)
     {
-        await service.CreateAsync(companyId, username, startsAt, expiresAt);
-        return RedirectToAction(nameof(Index), new { companyId });
+        await service.CreateAsync(username, startsAt, expiresAt);
+        return RedirectToAction(nameof(Index));
     }
 
     [HttpPost]
-    public async Task<IActionResult> Delete(int id, string companyId)
+    public async Task<IActionResult> Delete(int id)
     {
         await service.DeleteAsync(id);
-        return RedirectToAction(nameof(Index), new { companyId });
+        return RedirectToAction(nameof(Index));
     }
 }
+

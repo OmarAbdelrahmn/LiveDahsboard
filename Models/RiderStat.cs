@@ -5,9 +5,10 @@ using System.ComponentModel.DataAnnotations.Schema;
 namespace LiveDahsboard.Models;
 
 
-[Index(nameof(CompanyId), nameof(Date))]                           // GET query index
-[Index(nameof(RiderId), nameof(RiderName), nameof(Date), nameof(CompanyId), IsUnique = true)]  // Upsert lookup index
-[Index(nameof(Date))]                                               // Date range scans
+
+[Index(nameof(CompanyId), nameof(Date))]
+[Index(nameof(RiderId), nameof(RiderName), nameof(Date), nameof(CompanyId), IsUnique = true)]
+[Index(nameof(Date))]
 public class RiderStat
 {
     public int Id { get; set; }
@@ -30,6 +31,24 @@ public class RiderStat
 
     [Column(TypeName = "decimal(10,2)")]
     public decimal WorkingHours { get; set; }
+
+    // ── NEW: shift accumulation fields ──────────────────────
+    // These are internal tracking fields, never exposed in DTOs.
+
+    /// <summary>Sum of all COMPLETED shifts' hours for today.</summary>
+    [Column(TypeName = "decimal(10,2)")]
+    public decimal WorkingHoursBase { get; set; }
+
+    /// <summary>The last raw value we received from the API for hours.</summary>
+    [Column(TypeName = "decimal(10,2)")]
+    public decimal LastSeenWorkingHours { get; set; }
+
+    /// <summary>Sum of all COMPLETED shifts' orders for today.</summary>
+    public int OrdersBase { get; set; }
+
+    /// <summary>The last raw value we received from the API for orders.</summary>
+    public int LastSeenOrders { get; set; }
+    // ─────────────────────────────────────────────────────────
 
     public DateTime LastUpdatedAt { get; set; } = DateTime.UtcNow;
 }

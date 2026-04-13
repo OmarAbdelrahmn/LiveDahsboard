@@ -8,16 +8,19 @@ namespace LiveDahsboard.Services;
 
 public class RiderStatService(ApplicationDbContext db) : IRiderStatService
 {
+    // ── UPSERT ─────────────────────────────────────────────────────────────
+    // Called every 30 seconds from the Chrome extension.
+    // The API always sends values-since-shift-start (resets each new shift).
+    // We detect the reset and accumulate correctly.
     public async Task UpsertBatchAsync(IEnumerable<RiderStatDto> items)
     {
         var list = items.ToList();
 
-        // Load all existing matching records in ONE query
-        var keys = list.Select(i => new { i.RiderId, i.RiderName, i.Date, i.CompanyId }).ToList();
-        var dates = keys.Select(k => k.Date).Distinct().ToList();
-        var riderIds = keys.Select(k => k.RiderId).Distinct().ToList();
-        var companyIds = keys.Select(k => k.CompanyId).Distinct().ToList();
+        var dates = list.Select(i => i.Date).Distinct().ToList();
+        var riderIds = list.Select(i => i.RiderId).Distinct().ToList();
+        var companyIds = list.Select(i => i.CompanyId).Distinct().ToList();
 
+        // Load ALL existing records for these riders/dates in ONE query
         var existing = await db.RiderStats
             .Where(r => riderIds.Contains(r.RiderId)
                      && companyIds.Contains(r.CompanyId)
@@ -25,22 +28,50 @@ public class RiderStatService(ApplicationDbContext db) : IRiderStatService
             .ToListAsync();
 
         var existingMap = existing.ToDictionary(
-            r => (r.RiderId, r.RiderName, r.Date, r.CompanyId));
+            r => (r.RiderId, r.Date, r.CompanyId));
 
         var now = DateTime.UtcNow;
 
         foreach (var dto in list)
         {
-            var key = (dto.RiderId, dto.RiderName, dto.Date, dto.CompanyId);
+            var key = (dto.RiderId, dto.Date, dto.CompanyId);
+
             if (existingMap.TryGetValue(key, out var record))
             {
+                // ── HOURS ───────────────────────────────────────────────
+                // Example:
+                //   Shift 1 ends at 3.0h  → LastSeen = 3.0, Base = 0
+                //   Shift 2 sends 0.5h    → 0.5 < 3.0 = RESET
+                //     → Base becomes 3.0, LastSeen becomes 0.5
+                //     → Total = 3.0 + 0.5 = 3.5  ✅
+                //   Shift 2 sends 0.6h    → 0.6 > 0.5 = same shift
+                //     → Total = 3.0 + 0.6 = 3.6  ✅
+                if (dto.WorkingHours < record.LastSeenWorkingHours)
+                {
+                    // New shift detected — bank the last seen value
+                    record.WorkingHoursBase += record.LastSeenWorkingHours;
+                }
+                record.LastSeenWorkingHours = dto.WorkingHours;
+                record.WorkingHours = record.WorkingHoursBase + dto.WorkingHours;
+
+                // ── ORDERS ──────────────────────────────────────────────
+                // Same exact logic as hours
+                if (dto.Orders < record.LastSeenOrders)
+                {
+                    record.OrdersBase += record.LastSeenOrders;
+                }
+                record.LastSeenOrders = dto.Orders;
+                record.Orders = record.OrdersBase + dto.Orders;
+
+                // ── WALLET ──────────────────────────────────────────────
+                // Wallet is a current balance, not cumulative — always use latest
                 record.Wallet = dto.Wallet;
-                record.Orders = dto.Orders;
-                record.WorkingHours = dto.WorkingHours;
+
                 record.LastUpdatedAt = now;
             }
             else
             {
+                // First time we see this rider today — no history yet
                 db.RiderStats.Add(new RiderStat
                 {
                     RiderId = dto.RiderId,
@@ -49,7 +80,11 @@ public class RiderStatService(ApplicationDbContext db) : IRiderStatService
                     Date = dto.Date,
                     Wallet = dto.Wallet,
                     Orders = dto.Orders,
+                    OrdersBase = 0,
+                    LastSeenOrders = dto.Orders,
                     WorkingHours = dto.WorkingHours,
+                    WorkingHoursBase = 0,
+                    LastSeenWorkingHours = dto.WorkingHours,
                     LastUpdatedAt = now
                 });
             }
@@ -58,7 +93,11 @@ public class RiderStatService(ApplicationDbContext db) : IRiderStatService
         await db.SaveChangesAsync();
     }
 
-    public async Task<CompanyDayStats?> GetByCompanyAndDateAsync(string companyId, DateOnly date)
+    // ── GET BY COMPANY + DATE ──────────────────────────────────────────────
+    // WorkingHours and Orders in the DB are already the correct accumulated
+    // totals — no extra calculation needed here.
+    public async Task<CompanyDayStats?> GetByCompanyAndDateAsync(
+        string companyId, DateOnly date)
     {
         var riders = await db.RiderStats
             .AsNoTracking()
@@ -70,7 +109,9 @@ public class RiderStatService(ApplicationDbContext db) : IRiderStatService
         return BuildStats(companyId, date, riders);
     }
 
-    public async Task<IEnumerable<CompanyDayStats>> GetCompanySummaryAsync(string companyId, int lastDays = 30)
+    // ── GET SUMMARY (last N days) ──────────────────────────────────────────
+    public async Task<IEnumerable<CompanyDayStats>> GetCompanySummaryAsync(
+        string companyId, int lastDays = 30)
     {
         var from = DateOnly.FromDateTime(DateTime.UtcNow.AddDays(-lastDays));
 
@@ -85,13 +126,26 @@ public class RiderStatService(ApplicationDbContext db) : IRiderStatService
             .Select(g => BuildStats(companyId, g.Key, g.ToList()));
     }
 
-    private static CompanyDayStats BuildStats(string companyId, DateOnly date, IList<RiderStat> riders) =>
+    // ── HELPER ─────────────────────────────────────────────────────────────
+    // Reads WorkingHours and Orders directly from DB — they are already
+    // the correct full-day totals thanks to the upsert logic above.
+    private static CompanyDayStats BuildStats(
+        string companyId, DateOnly date, IList<RiderStat> riders) =>
         new(
-            companyId, date,
-            riders.Count,
-            riders.Sum(r => r.Orders),
-            riders.Sum(r => r.Wallet),
-            riders.Sum(r => r.WorkingHours),
-            riders.Select(r => new RiderStatDto(r.RiderId, r.RiderName, r.CompanyId, r.Date, r.Wallet, r.Orders, r.WorkingHours))
+            companyId,
+            date,
+            TotalRiders: riders.Count,
+            TotalOrders: riders.Sum(r => r.Orders),
+            TotalWallet: riders.Sum(r => r.Wallet),
+            TotalWorkingHours: riders.Sum(r => r.WorkingHours),
+            Riders: riders.Select(r => new RiderStatDto(
+                r.RiderId,
+                r.RiderName,
+                r.CompanyId,
+                r.Date,
+                r.Wallet,
+                r.Orders,
+                r.WorkingHours   // ← already the full-day accumulated total
+            ))
         );
 }
