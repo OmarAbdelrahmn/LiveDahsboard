@@ -31,7 +31,7 @@ public class RiderNameOverrideController(IRiderNameOverrideService service) : Co
 
     // PATCH api/rider-names/{companyId}/{riderId}
     // Body: { "overrideName": "Ahmed Al-Ghamdi" }
-    [HttpPatch("{riderId}")]
+    [HttpPut("{riderId}")]
     public async Task<IActionResult> UpdateName(string companyId, string riderId,
         [FromBody] UpdateRiderNameRequest request)
     {
