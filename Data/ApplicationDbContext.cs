@@ -9,4 +9,5 @@ public class ApplicationDbContext(DbContextOptions<ApplicationDbContext> options
 {
     public DbSet<RiderStat> RiderStats => Set<RiderStat>();
     public DbSet<ExternalProvider> ExternalProviders => Set<ExternalProvider>();
+    public DbSet<RiderNameOverride> RiderNameOverrides => Set<RiderNameOverride>();
 }

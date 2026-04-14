@@ -46,17 +46,19 @@ public class RiderStatService(ApplicationDbContext db) : IRiderStatService
                 //     → Total = 3.0 + 0.5 = 3.5  ✅
                 //   Shift 2 sends 0.6h    → 0.6 > 0.5 = same shift
                 //     → Total = 3.0 + 0.6 = 3.6  ✅
-                if (dto.WorkingHours < record.LastSeenWorkingHours)
+                // ── HOURS ───────────────────────────────────────────────
+                const decimal RESET_THRESHOLD_HOURS = 1.0m;
+
+                if (record.LastSeenWorkingHours - dto.WorkingHours > RESET_THRESHOLD_HOURS)
                 {
-                    // New shift detected — bank the last seen value
                     record.WorkingHoursBase += record.LastSeenWorkingHours;
                 }
                 record.LastSeenWorkingHours = dto.WorkingHours;
                 record.WorkingHours = record.WorkingHoursBase + dto.WorkingHours;
 
                 // ── ORDERS ──────────────────────────────────────────────
-                // Same exact logic as hours
-                if (dto.Orders < record.LastSeenOrders)
+                if (record.LastSeenWorkingHours - dto.WorkingHours > RESET_THRESHOLD_HOURS
+                    && dto.Orders < record.LastSeenOrders)
                 {
                     record.OrdersBase += record.LastSeenOrders;
                 }
