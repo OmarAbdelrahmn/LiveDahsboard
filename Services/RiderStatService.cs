@@ -56,9 +56,11 @@ public class RiderStatService(ApplicationDbContext db) : IRiderStatService
                 record.LastSeenWorkingHours = dto.WorkingHours;
                 record.WorkingHours = record.WorkingHoursBase + dto.WorkingHours;
 
+
+
                 // ── ORDERS ──────────────────────────────────────────────
-                if (record.LastSeenWorkingHours - dto.WorkingHours > RESET_THRESHOLD_HOURS
-                    && dto.Orders < record.LastSeenOrders)
+                if (
+                    dto.Orders < record.LastSeenOrders)
                 {
                     record.OrdersBase += record.LastSeenOrders;
                 }
@@ -104,6 +106,7 @@ public class RiderStatService(ApplicationDbContext db) : IRiderStatService
         var riders = await db.RiderStats
             .AsNoTracking()
             .Where(r => r.CompanyId == companyId && r.Date == date)
+            .OrderByDescending(r => r.WorkingHours)  
             .ToListAsync();
 
         if (!riders.Any()) return null;
