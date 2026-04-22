@@ -1,4 +1,4 @@
-﻿@{
+﻿@* @{
     ViewBag.Title = "Register"; Layout = null;
 }
 <!DOCTYPE html>
@@ -50,6 +50,37 @@
         <p class="text-center mb-0 small">
             Already have an account? <a asp-action="Login">Sign in</a>
         </p>
+    </div>
+</body>
+</html> *@
+
+
+@{
+    ViewBag.Title = "Register"; Layout = null;
+}
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Register — RiderDash</title>
+    <link rel="stylesheet"
+          href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" />
+    <style>
+            body {
+                background: #f5f5f5;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                min-height: 100vh;
+            }
+    </style>
+</head>
+<body>
+    <div class="card shadow-sm text-center" style="width:360px;padding:2rem">
+        <h4 class="mb-3">Registration Disabled</h4>
+        <p class="text-muted mb-4">Account registration is not available. Please contact an administrator.</p>
+        <a asp-controller="Account" asp-action="Login" class="btn btn-primary">Back to Sign in</a>
     </div>
 </body>
 </html>
