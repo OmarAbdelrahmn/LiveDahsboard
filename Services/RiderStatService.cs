@@ -59,11 +59,39 @@ public class RiderStatService(ApplicationDbContext db) : IRiderStatService
 
 
                 // ── ORDERS ──────────────────────────────────────────────
-                if (
-                    dto.Orders < record.LastSeenOrders)
+                // Scenario A: 10 → 0 → 10  (glitch)   → total stays 10  ✅
+                // Scenario B: 10 → 0 → 5   (new shift) → total = 10 + 5 = 15 ✅
+                // Scenario C: 10 → 5        (mid-drop)  → total = 10 + 5 = 15 ✅
+
+                if (dto.Orders < record.LastSeenOrders)
                 {
-                    record.OrdersBase += record.LastSeenOrders;
+                    if (dto.Orders == 0)
+                    {
+                        // Orders just hit zero — could be a glitch or real shift end.
+                        // Snapshot the last good value and wait one tick to decide.
+                        record.OrdersSnapshottedBeforeReset = record.LastSeenOrders;
+                    }
+                    else
+                    {
+                        // Dropped to a non-zero lower value mid-shift (e.g. 10 → 7).
+                        // This is a real new shift — commit immediately.
+                        record.OrdersBase += record.LastSeenOrders;
+                        record.OrdersSnapshottedBeforeReset = 0;
+                    }
                 }
+                else if (dto.Orders > 0 && record.OrdersSnapshottedBeforeReset > 0)
+                {
+                    // We're coming back from a 0. Now we can decide:
+                    if (dto.Orders < record.OrdersSnapshottedBeforeReset)
+                    {
+                        // e.g. 10 → 0 → 5 — truly a new shift, commit the old one
+                        record.OrdersBase += record.OrdersSnapshottedBeforeReset;
+                    }
+                    // else: e.g. 10 → 0 → 10 — glitch, don't add anything
+
+                    record.OrdersSnapshottedBeforeReset = 0;  // clear pending either way
+                }
+
                 record.LastSeenOrders = dto.Orders;
                 record.Orders = record.OrdersBase + dto.Orders;
 
@@ -89,7 +117,8 @@ public class RiderStatService(ApplicationDbContext db) : IRiderStatService
                     WorkingHours = dto.WorkingHours,
                     WorkingHoursBase = 0,
                     LastSeenWorkingHours = dto.WorkingHours,
-                    LastUpdatedAt = now
+                    LastUpdatedAt = now,
+                    OrdersSnapshottedBeforeReset = 0,   // ← add this line
                 });
             }
         }
