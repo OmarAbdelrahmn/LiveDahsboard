@@ -50,6 +50,8 @@ public class RiderStat
     public int LastSeenOrders { get; set; }
     // ─────────────────────────────────────────────────────────
 
+    public int OrdersDayStart { get; set; }
+
     public int OrdersSnapshottedBeforeReset { get; set; }
 
     public DateTime LastUpdatedAt { get; set; } = DateTime.UtcNow;

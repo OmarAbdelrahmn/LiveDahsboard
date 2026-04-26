@@ -30,6 +30,7 @@ builder.Services.ConfigureApplicationCookie(o =>
 builder.Services.AddScoped<IRiderStatService, RiderStatService>();
 builder.Services.AddScoped<IExternalProviderService, ExternalProviderService>();
 builder.Services.AddScoped<IRiderNameOverrideService, RiderNameOverrideService>();
+builder.Services.AddScoped<IKeetaStatService, KeetaStatService>();
 
 builder.Services.AddControllersWithViews();
 

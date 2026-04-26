@@ -59,51 +59,47 @@ public class RiderStatService(ApplicationDbContext db) : IRiderStatService
 
 
                 // ── ORDERS ──────────────────────────────────────────────
-                // Scenario A: 10 → 0 → 10  (glitch)   → total stays 10  ✅
-                // Scenario B: 10 → 0 → 5   (new shift) → total = 10 + 5 = 15 ✅
-                // Scenario C: 10 → 5        (mid-drop)  → total = 10 + 5 = 15 ✅
-
                 if (dto.Orders < record.LastSeenOrders)
                 {
                     if (dto.Orders == 0)
                     {
-                        // Orders just hit zero — could be a glitch or real shift end.
-                        // Snapshot the last good value and wait one tick to decide.
+                        // Might be a glitch or real shift end — wait one tick to decide
                         record.OrdersSnapshottedBeforeReset = record.LastSeenOrders;
                     }
                     else
                     {
-                        // Dropped to a non-zero lower value mid-shift (e.g. 10 → 7).
-                        // This is a real new shift — commit immediately.
-                        record.OrdersBase += record.LastSeenOrders;
+                        // Non-zero drop → real new shift (e.g. 10 → 5)
+                        // Commit only TODAY's contribution from the old shift
+                        record.OrdersBase += record.LastSeenOrders - record.OrdersDayStart;
+                        record.OrdersDayStart = 0;   // baseline no longer applies
                         record.OrdersSnapshottedBeforeReset = 0;
                     }
                 }
                 else if (dto.Orders > 0 && record.OrdersSnapshottedBeforeReset > 0)
                 {
-                    // We're coming back from a 0. Now we can decide:
+                    // Recovering from a zero — now we can decide
                     if (dto.Orders < record.OrdersSnapshottedBeforeReset)
                     {
-                        // e.g. 10 → 0 → 5 — truly a new shift, commit the old one
-                        record.OrdersBase += record.OrdersSnapshottedBeforeReset;
+                        // Real new shift (e.g. 10 → 0 → 3): commit today's old-shift contribution
+                        record.OrdersBase += record.OrdersSnapshottedBeforeReset - record.OrdersDayStart;
+                        record.OrdersDayStart = 0;   // baseline no longer applies
                     }
-                    // else: e.g. 10 → 0 → 10 — glitch, don't add anything
+                    // else: glitch (10 → 0 → 10) — don't add anything
 
-                    record.OrdersSnapshottedBeforeReset = 0;  // clear pending either way
+                    record.OrdersSnapshottedBeforeReset = 0;
                 }
 
                 record.LastSeenOrders = dto.Orders;
-                record.Orders = record.OrdersBase + dto.Orders;
 
-                // ── WALLET ──────────────────────────────────────────────
-                // Wallet is a current balance, not cumulative — always use latest
+                // max(0,...) prevents a negative display during the zero-orders gap
+                record.Orders = Math.Max(0, record.OrdersBase + dto.Orders - record.OrdersDayStart);
+
+                // ── WALLET (unchanged) ───────────────────────────────────
                 record.Wallet = dto.Wallet;
-
                 record.LastUpdatedAt = now;
             }
             else
             {
-                // First time we see this rider today — no history yet
                 db.RiderStats.Add(new RiderStat
                 {
                     RiderId = dto.RiderId,
@@ -111,19 +107,19 @@ public class RiderStatService(ApplicationDbContext db) : IRiderStatService
                     CompanyId = dto.CompanyId,
                     Date = dto.Date,
                     Wallet = dto.Wallet,
-                    Orders = dto.Orders,
+                    Orders = 0,
                     OrdersBase = 0,
+                    OrdersDayStart = dto.Orders,    // ← remember what API showed at day-start
                     LastSeenOrders = dto.Orders,
                     WorkingHours = dto.WorkingHours,
                     WorkingHoursBase = 0,
                     LastSeenWorkingHours = dto.WorkingHours,
                     LastUpdatedAt = now,
-                    OrdersSnapshottedBeforeReset = 0,   // ← add this line
+                    OrdersSnapshottedBeforeReset = 0,
                 });
             }
+            await db.SaveChangesAsync();
         }
-
-        await db.SaveChangesAsync();
     }
 
     // ── GET BY COMPANY + DATE ──────────────────────────────────────────────
