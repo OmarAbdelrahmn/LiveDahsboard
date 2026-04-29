@@ -1,211 +1,201 @@
-﻿using LiveDahsboard.Data;
+﻿// Services/RiderShiftStatService.cs
+using LiveDahsboard.Data;
 using LiveDahsboard.DTOs;
 using LiveDahsboard.Models;
 using Microsoft.EntityFrameworkCore;
 
 namespace LiveDahsboard.Services;
 
-public class RiderStatService(ApplicationDbContext db) : IRiderStatService
+public class RiderShiftStatService(ApplicationDbContext db) : IRiderShiftStatService
 {
-    // ── RESET THRESHOLDS ───────────────────────────────────────────────────
-    // A drop larger than this is treated as a genuine new shift, not a glitch.
-    private const decimal HOURS_RESET_THRESHOLD = 0.5m;   // 30 minutes
-    private const int ORDERS_ZERO_GRACE_TICKS = 2;     // allow 2 zero readings before committing
+    private static readonly TimeZoneInfo SaudiTz =
+        TimeZoneInfo.FindSystemTimeZoneById("Arab Standard Time");
 
     // ── UPSERT ─────────────────────────────────────────────────────────────
-    public async Task UpsertBatchAsync(IEnumerable<RiderStatDto> items)
+    public async Task UpsertBatchAsync(IEnumerable<RiderShiftStatIncoming> items)
     {
-        var list = items.ToList();
+        var list = items
+            .Where(i => i.ActiveShiftStartedAt.HasValue)
+            .ToList();
+
         if (list.Count == 0) return;
 
-        var dates = list.Select(i => i.Date).Distinct().ToList();
-        var riderIds = list.Select(i => i.RiderId).Distinct().ToList();
-        var companyIds = list.Select(i => i.CompanyId).Distinct().ToList();
+        // Each incoming item may produce 1 or 2 DB records (midnight split)
+        var allSegments = list.SelectMany(BuildSegments).ToList();
 
-        var existing = await db.RiderStats
+        var riderIds = allSegments.Select(s => s.RiderId).Distinct().ToList();
+        var companyIds = allSegments.Select(s => s.CompanyId).Distinct().ToList();
+        var shifts = allSegments.Select(s => s.ActiveShiftStartedAt).Distinct().ToList();
+
+        var existing = await db.RiderShiftStats
             .Where(r => riderIds.Contains(r.RiderId)
                      && companyIds.Contains(r.CompanyId)
-                     && dates.Contains(r.Date))
+                     && shifts.Contains(r.ActiveShiftStartedAt))
             .ToListAsync();
 
-        var map = existing.ToDictionary(r => (r.RiderId, r.Date, r.CompanyId));
+        var map = existing.ToDictionary(r => (r.RiderId, r.CompanyId, r.ActiveShiftStartedAt));
         var now = DateTime.UtcNow;
 
-        foreach (var dto in list)
+        foreach (var seg in allSegments)
         {
-            var key = (dto.RiderId, dto.Date, dto.CompanyId);
+            var key = (seg.RiderId, seg.CompanyId, seg.ActiveShiftStartedAt);
 
             if (map.TryGetValue(key, out var record))
             {
-                UpdateExisting(record, dto, now);
+                record.RiderName = seg.RiderName;
+                record.Orders = seg.Orders;
+                record.WorkingHours = seg.WorkingHours;
+                record.Wallet = seg.Wallet;
+                record.LastUpdatedAt = now;
             }
             else
             {
-                var newRecord = CreateNew(dto, now);
-                db.RiderStats.Add(newRecord);
-                map[key] = newRecord;   // guard against duplicates in same batch
+                var newRecord = new RiderShiftStat
+                {
+                    RiderId = seg.RiderId,
+                    RiderName = seg.RiderName,
+                    CompanyId = seg.CompanyId,
+                    ActiveShiftStartedAt = seg.ActiveShiftStartedAt,
+                    Date = seg.Date,
+                    Orders = seg.Orders,
+                    WorkingHours = seg.WorkingHours,
+                    Wallet = seg.Wallet,
+                    LastUpdatedAt = now,
+                };
+                db.RiderShiftStats.Add(newRecord);
+                map[key] = newRecord;
             }
         }
 
-        // ── ONE save for the entire batch ──────────────────────────────────
         await db.SaveChangesAsync();
     }
 
-    // ── UPDATE EXISTING RECORD ─────────────────────────────────────────────
-    private static void UpdateExisting(RiderStat record, RiderStatDto dto, DateTime now)
-    {
-        // Always keep the name fresh in case it changed in the API
-        if (!string.IsNullOrWhiteSpace(dto.RiderName))
-            record.RiderName = dto.RiderName;
-
-        UpdateHours(record, dto.WorkingHours);
-        UpdateOrders(record, dto.Orders);
-
-        record.Wallet = dto.Wallet;
-        record.LastUpdatedAt = now;
-    }
-
-    // ── HOURS ACCUMULATION ─────────────────────────────────────────────────
-    // API sends hours-since-shift-start. When a new shift begins the value
-    // resets to ~0, so a large drop means "commit the completed shift."
-    private static void UpdateHours(RiderStat record, decimal incomingHours)
-    {
-        var drop = record.LastSeenWorkingHours - incomingHours;
-
-        if (drop > HOURS_RESET_THRESHOLD)
-        {
-            // New shift detected: bank the completed shift's hours
-            record.WorkingHoursBase += record.LastSeenWorkingHours;
-        }
-
-        record.LastSeenWorkingHours = incomingHours;
-        record.WorkingHours = record.WorkingHoursBase + incomingHours;
-    }
-
-    // ── ORDERS ACCUMULATION ────────────────────────────────────────────────
-    // Three cases:
-    //  1. Normal increment:    dto.Orders >= LastSeen          → same shift
-    //  2. Drop to zero:        dto.Orders == 0, was > 0        → snapshot, wait
-    //  3. Non-zero drop:       0 < dto.Orders < LastSeen       → new shift confirmed
+    // ── MIDNIGHT SPLIT LOGIC ───────────────────────────────────────────────
+    // A shift that crosses midnight in UTC+3 is split into two segments:
     //
-    // "ZeroTicks" lets us absorb a single glitch zero before committing.
-    private static void UpdateOrders(RiderStat record, int incomingOrders)
+    //   Segment A  →  date of shift start  →  hours from shift start → midnight
+    //   Segment B  →  next date            →  hours from midnight    → now (capped)
+    //
+    // Key rule: if the reported workedSeconds would exceed the time elapsed
+    // since midnight on the CURRENT date, cap it to elapsed time.
+    // This prevents a shift that just started at 11 PM from reporting 2 h
+    // on today's date when only 1 h has actually passed today.
+    //
+    // The shift identity key (ActiveShiftStartedAt) is the SAME for both
+    // segments so that upsert can find and update each date row correctly.
+    // ──────────────────────────────────────────────────────────────────────
+    private static IEnumerable<ShiftSegment> BuildSegments(RiderShiftStatIncoming item)
     {
-        if (incomingOrders < record.LastSeenOrders)
-        {
-            if (incomingOrders == 0)
-            {
-                // Could be a glitch — snapshot and wait up to GRACE ticks
-                if (record.OrdersSnapshottedBeforeReset == 0)
-                    record.OrdersSnapshottedBeforeReset = record.LastSeenOrders;
+        var shiftStartUtc = item.ActiveShiftStartedAt!.Value;
+        var nowUtc = DateTime.UtcNow;
+        var totalHours = item.WorkedSeconds / 3600m;
 
-                record.LastSeenOrders = 0;
-                // Don't change Orders yet — keep showing last known value
-                return;
-            }
-            else
-            {
-                // Unambiguous drop to non-zero: definitely a new shift
-                CommitCompletedShift(record);
-            }
-        }
-        else if (record.OrdersSnapshottedBeforeReset > 0)
+        // Convert to Saudi local time (UTC+3)
+        var shiftStartLocal = TimeZoneInfo.ConvertTimeFromUtc(shiftStartUtc, SaudiTz);
+        var nowLocal = TimeZoneInfo.ConvertTimeFromUtc(nowUtc, SaudiTz);
+
+        var shiftStartDate = DateOnly.FromDateTime(shiftStartLocal);
+        var todayLocal = DateOnly.FromDateTime(nowLocal);
+
+        // ── No midnight crossing ───────────────────────────────────────────
+        if (shiftStartDate == todayLocal)
         {
-            // We were in a "zero grace" window — now resolving it
-            if (incomingOrders > 0 && incomingOrders < record.OrdersSnapshottedBeforeReset)
-            {
-                // Recovered with fewer orders → genuine new shift
-                CommitCompletedShift(record);
-            }
-            else if (incomingOrders >= record.OrdersSnapshottedBeforeReset)
-            {
-                // Recovered at same or higher level → was a glitch, cancel snapshot
-                record.OrdersSnapshottedBeforeReset = 0;
-            }
-            // incomingOrders == 0 again: still in grace, keep waiting
+            // Cap: can't have worked more hours than have elapsed since shift start
+            var elapsedHours = (decimal)(nowUtc - shiftStartUtc).TotalHours;
+            var hoursToday = Math.Min(totalHours, Math.Max(0, elapsedHours));
+
+            yield return new ShiftSegment(
+                item, shiftStartDate, item.ActiveShiftStartedAt!.Value, hoursToday);
+
+            yield break;
         }
 
-        record.LastSeenOrders = incomingOrders;
-        record.Orders = record.OrdersBase + incomingOrders;
+        // ── Midnight crossing detected ─────────────────────────────────────
+        // Shift started on a PREVIOUS calendar date (local time).
+        // Split at local midnight between the two dates.
+
+        // midnight that separates the two days (in UTC)
+        var midnightLocal = shiftStartDate.ToDateTime(TimeOnly.MinValue).AddDays(1);
+        // convert that local midnight back to UTC
+        var midnightUtc = TimeZoneInfo.ConvertTimeToUtc(midnightLocal, SaudiTz);
+
+        // Hours the rider worked on the START date (before midnight)
+        var hoursBeforeMidnight = (decimal)(midnightUtc - shiftStartUtc).TotalHours;
+        hoursBeforeMidnight = Math.Max(0, Math.Min(totalHours, hoursBeforeMidnight));
+
+        // Hours worked on the NEXT date (after midnight, capped to elapsed time today)
+        var hoursAfterMidnight = totalHours - hoursBeforeMidnight;
+        var elapsedTodayHours = (decimal)(nowUtc - midnightUtc).TotalHours;
+        hoursAfterMidnight = Math.Max(0, Math.Min(hoursAfterMidnight, elapsedTodayHours));
+
+        // Segment A — previous date, shift identity = original shift start
+        yield return new ShiftSegment(
+            item, shiftStartDate, shiftStartUtc, hoursBeforeMidnight);
+
+        // Segment B — today's date, shift identity = midnight UTC
+        // Using midnight as the key keeps today's segment uniquely identifiable
+        // while still being tied to the same physical shift.
+        yield return new ShiftSegment(
+            item, todayLocal, midnightUtc, hoursAfterMidnight);
     }
 
-    private static void CommitCompletedShift(RiderStat record)
-    {
-        // Bank the highest known value from the completed shift
-        var completedShiftOrders = record.OrdersSnapshottedBeforeReset > 0
-            ? record.OrdersSnapshottedBeforeReset
-            : record.LastSeenOrders;
-
-        record.OrdersBase += completedShiftOrders;
-        record.OrdersSnapshottedBeforeReset = 0;
-    }
-
-    // ── CREATE NEW RECORD ──────────────────────────────────────────────────
-    // Key fix: Orders starts at dto.Orders (not 0) so that riders who are
-    // mid-shift when the extension first sees them are counted correctly.
-    private static RiderStat CreateNew(RiderStatDto dto, DateTime now) => new()
-    {
-        RiderId = dto.RiderId,
-        RiderName = dto.RiderName,
-        CompanyId = dto.CompanyId,
-        Date = dto.Date,
-        Wallet = dto.Wallet,
-
-        // Start from whatever the API reports right now
-        Orders = dto.Orders,
-        OrdersBase = 0,
-        LastSeenOrders = dto.Orders,
-        OrdersSnapshottedBeforeReset = 0,
-
-        // OrdersDayStart kept at 0 — no longer subtracted in UpdateOrders
-        OrdersDayStart = 0,
-
-        WorkingHours = dto.WorkingHours,
-        WorkingHoursBase = 0,
-        LastSeenWorkingHours = dto.WorkingHours,
-
-        LastUpdatedAt = now,
-    };
-
-    // ── READ ENDPOINTS (unchanged logic) ───────────────────────────────────
+    // ── READ: GET BY COMPANY + DATE ────────────────────────────────────────
     public async Task<CompanyDayStats?> GetByCompanyAndDateAsync(
         string companyId, DateOnly date)
     {
-        var riders = await db.RiderStats
+        var shifts = await db.RiderShiftStats
             .AsNoTracking()
             .Where(r => r.CompanyId == companyId && r.Date == date)
-            .OrderByDescending(r => r.WorkingHours)
+            .OrderByDescending(r => r.Orders)
             .ToListAsync();
 
-        return riders.Count == 0 ? null : BuildStats(companyId, date, riders);
+        return shifts.Count == 0 ? null : BuildStats(companyId, date, shifts);
     }
 
+    // ── READ: COMPANY SUMMARY (last N days) ────────────────────────────────
     public async Task<IEnumerable<CompanyDayStats>> GetCompanySummaryAsync(
         string companyId, int lastDays = 30)
     {
-        var from = DateOnly.FromDateTime(DateTime.UtcNow.AddDays(-lastDays));
+        var nowLocal = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, SaudiTz);
+        var from = DateOnly.FromDateTime(nowLocal).AddDays(-lastDays);
 
-        var riders = await db.RiderStats
+        var shifts = await db.RiderShiftStats
             .AsNoTracking()
             .Where(r => r.CompanyId == companyId && r.Date >= from)
             .ToListAsync();
 
-        return riders
+        return shifts
             .GroupBy(r => r.Date)
             .OrderByDescending(g => g.Key)
             .Select(g => BuildStats(companyId, g.Key, g.ToList()));
     }
 
+    // ── BUILD STATS ────────────────────────────────────────────────────────
     private static CompanyDayStats BuildStats(
-        string companyId, DateOnly date, IList<RiderStat> riders) => new(
+        string companyId, DateOnly date, IList<RiderShiftStat> shifts) => new(
             companyId,
             date,
-            TotalRiders: riders.Count,
-            TotalOrders: riders.Sum(r => r.Orders),
-            TotalWallet: riders.Sum(r => r.Wallet),
-            TotalWorkingHours: riders.Sum(r => r.WorkingHours),
-            Riders: riders.Select(r => new RiderStatDto(
-                r.RiderId, r.RiderName, r.CompanyId, r.Date,
+            TotalRiders: shifts.Select(r => r.RiderId).Distinct().Count(),
+            TotalOrders: shifts.Sum(r => r.Orders),
+            TotalWallet: shifts.Sum(r => r.Wallet),
+            TotalWorkingHours: shifts.Sum(r => r.WorkingHours),
+            Riders: shifts.Select(r => new RiderShiftStatDto(
+                r.RiderId, r.RiderName, r.CompanyId,
+                r.ActiveShiftStartedAt, r.Date,
                 r.Wallet, r.Orders, r.WorkingHours))
         );
+
+    // ── INTERNAL SEGMENT RECORD ────────────────────────────────────────────
+    private record ShiftSegment(
+        RiderShiftStatIncoming Source,
+        DateOnly Date,
+        DateTime ActiveShiftStartedAt,
+        decimal WorkingHours)
+    {
+        public string RiderId => Source.RiderId;
+        public string RiderName => Source.RiderName;
+        public string CompanyId => Source.CompanyId;
+        public int Orders => Source.Orders;
+        public decimal Wallet => Source.Wallet;
+    }
 }

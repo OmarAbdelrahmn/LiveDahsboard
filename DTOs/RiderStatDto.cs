@@ -10,6 +10,31 @@ public record RiderStatDto(
     decimal WorkingHours
 );
 
+// DTOs/RiderShiftStatIncoming.cs
+// This is what the frontend PUT sends — raw values, no derived fields.
+public record RiderShiftStatIncoming(
+    string RiderId,
+    string RiderName,
+    string CompanyId,
+    string Status,
+    DateTime? ActiveShiftStartedAt,
+    DateTime? ActiveShiftEndedAt,
+    decimal Wallet,
+    int Orders,
+    int WorkedSeconds,      // raw from performance.time_spent.worked_seconds
+    int BreakSeconds        // raw from performance.time_spent.break_seconds
+);
+
+public record RiderShiftStatDto(
+    string RiderId,
+    string RiderName,
+    string CompanyId,
+    DateTime ActiveShiftStartedAt,
+    DateOnly Date,
+    decimal Wallet,
+    int Orders,
+    decimal WorkingHours
+);
 public record CompanyDayStats(
     string CompanyId,
     DateOnly Date,
@@ -17,8 +42,9 @@ public record CompanyDayStats(
     int TotalOrders,
     decimal TotalWallet,
     decimal TotalWorkingHours,
-    IEnumerable<RiderStatDto> Riders
+    IEnumerable<RiderShiftStatDto> Riders   // was RiderStatDto
 );
+
 
 
 public record KeetaStatDto(

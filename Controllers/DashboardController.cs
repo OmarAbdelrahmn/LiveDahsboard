@@ -6,7 +6,7 @@ namespace LiveDahsboard.Controllers;
 
 
 [Authorize]
-public class DashboardController(IRiderStatService service) : Controller
+public class DashboardController(IRiderShiftStatService service) : Controller
 {
     public async Task<IActionResult> Index(string companyId = "default", int days = 30)
     {

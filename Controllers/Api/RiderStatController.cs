@@ -6,10 +6,10 @@ namespace LiveDahsboard.Controllers.Api;
 
 [ApiController]
 [Route("api/rider-stats")]
-public class RiderStatController(IRiderStatService service) : ControllerBase
+public class RiderStatController(IRiderShiftStatService service) : ControllerBase
 {
     [HttpPut]
-    public async Task<IActionResult> Upsert([FromBody] List<RiderStatDto> items)
+    public async Task<IActionResult> Upsert([FromBody] List<RiderShiftStatIncoming> items)
     {
         if (items is null or { Count: 0 }) return BadRequest("Empty list");
         await service.UpsertBatchAsync(items);
