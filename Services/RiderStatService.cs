@@ -5,141 +5,181 @@ using Microsoft.EntityFrameworkCore;
 
 namespace LiveDahsboard.Services;
 
-
 public class RiderStatService(ApplicationDbContext db) : IRiderStatService
 {
+    // ── RESET THRESHOLDS ───────────────────────────────────────────────────
+    // A drop larger than this is treated as a genuine new shift, not a glitch.
+    private const decimal HOURS_RESET_THRESHOLD = 0.5m;   // 30 minutes
+    private const int ORDERS_ZERO_GRACE_TICKS = 2;     // allow 2 zero readings before committing
+
     // ── UPSERT ─────────────────────────────────────────────────────────────
-    // Called every 30 seconds from the Chrome extension.
-    // The API always sends values-since-shift-start (resets each new shift).
-    // We detect the reset and accumulate correctly.
     public async Task UpsertBatchAsync(IEnumerable<RiderStatDto> items)
     {
         var list = items.ToList();
+        if (list.Count == 0) return;
 
         var dates = list.Select(i => i.Date).Distinct().ToList();
         var riderIds = list.Select(i => i.RiderId).Distinct().ToList();
         var companyIds = list.Select(i => i.CompanyId).Distinct().ToList();
 
-        // Load ALL existing records for these riders/dates in ONE query
         var existing = await db.RiderStats
             .Where(r => riderIds.Contains(r.RiderId)
                      && companyIds.Contains(r.CompanyId)
                      && dates.Contains(r.Date))
             .ToListAsync();
 
-        var existingMap = existing.ToDictionary(
-            r => (r.RiderId, r.Date, r.CompanyId));
-
+        var map = existing.ToDictionary(r => (r.RiderId, r.Date, r.CompanyId));
         var now = DateTime.UtcNow;
 
         foreach (var dto in list)
         {
             var key = (dto.RiderId, dto.Date, dto.CompanyId);
 
-            if (existingMap.TryGetValue(key, out var record))
+            if (map.TryGetValue(key, out var record))
             {
-                // ── HOURS ───────────────────────────────────────────────
-                // Example:
-                //   Shift 1 ends at 3.0h  → LastSeen = 3.0, Base = 0
-                //   Shift 2 sends 0.5h    → 0.5 < 3.0 = RESET
-                //     → Base becomes 3.0, LastSeen becomes 0.5
-                //     → Total = 3.0 + 0.5 = 3.5  ✅
-                //   Shift 2 sends 0.6h    → 0.6 > 0.5 = same shift
-                //     → Total = 3.0 + 0.6 = 3.6  ✅
-                // ── HOURS ───────────────────────────────────────────────
-                const decimal RESET_THRESHOLD_HOURS = 1.0m;
-
-                if (record.LastSeenWorkingHours - dto.WorkingHours > RESET_THRESHOLD_HOURS)
-                {
-                    record.WorkingHoursBase += record.LastSeenWorkingHours;
-                }
-                record.LastSeenWorkingHours = dto.WorkingHours;
-                record.WorkingHours = record.WorkingHoursBase + dto.WorkingHours;
-
-
-
-                // ── ORDERS ──────────────────────────────────────────────
-                if (dto.Orders < record.LastSeenOrders)
-                {
-                    if (dto.Orders == 0)
-                    {
-                        // Might be a glitch or real shift end — wait one tick to decide
-                        record.OrdersSnapshottedBeforeReset = record.LastSeenOrders;
-                    }
-                    else
-                    {
-                        // Non-zero drop → real new shift (e.g. 10 → 5)
-                        // Commit only TODAY's contribution from the old shift
-                        record.OrdersBase += record.LastSeenOrders - record.OrdersDayStart;
-                        record.OrdersDayStart = 0;   // baseline no longer applies
-                        record.OrdersSnapshottedBeforeReset = 0;
-                    }
-                }
-                else if (dto.Orders > 0 && record.OrdersSnapshottedBeforeReset > 0)
-                {
-                    // Recovering from a zero — now we can decide
-                    if (dto.Orders < record.OrdersSnapshottedBeforeReset)
-                    {
-                        // Real new shift (e.g. 10 → 0 → 3): commit today's old-shift contribution
-                        record.OrdersBase += record.OrdersSnapshottedBeforeReset - record.OrdersDayStart;
-                        record.OrdersDayStart = 0;   // baseline no longer applies
-                    }
-                    // else: glitch (10 → 0 → 10) — don't add anything
-
-                    record.OrdersSnapshottedBeforeReset = 0;
-                }
-
-                record.LastSeenOrders = dto.Orders;
-
-                // max(0,...) prevents a negative display during the zero-orders gap
-                record.Orders = Math.Max(0, record.OrdersBase + dto.Orders - record.OrdersDayStart);
-
-                // ── WALLET (unchanged) ───────────────────────────────────
-                record.Wallet = dto.Wallet;
-                record.LastUpdatedAt = now;
+                UpdateExisting(record, dto, now);
             }
             else
             {
-                db.RiderStats.Add(new RiderStat
-                {
-                    RiderId = dto.RiderId,
-                    RiderName = dto.RiderName,
-                    CompanyId = dto.CompanyId,
-                    Date = dto.Date,
-                    Wallet = dto.Wallet,
-                    Orders = 0,
-                    OrdersBase = 0,
-                    OrdersDayStart = dto.Orders,    // ← remember what API showed at day-start
-                    LastSeenOrders = dto.Orders,
-                    WorkingHours = dto.WorkingHours,
-                    WorkingHoursBase = 0,
-                    LastSeenWorkingHours = dto.WorkingHours,
-                    LastUpdatedAt = now,
-                    OrdersSnapshottedBeforeReset = 0,
-                });
+                var newRecord = CreateNew(dto, now);
+                db.RiderStats.Add(newRecord);
+                map[key] = newRecord;   // guard against duplicates in same batch
             }
-            await db.SaveChangesAsync();
         }
+
+        // ── ONE save for the entire batch ──────────────────────────────────
+        await db.SaveChangesAsync();
     }
 
-    // ── GET BY COMPANY + DATE ──────────────────────────────────────────────
-    // WorkingHours and Orders in the DB are already the correct accumulated
-    // totals — no extra calculation needed here.
+    // ── UPDATE EXISTING RECORD ─────────────────────────────────────────────
+    private static void UpdateExisting(RiderStat record, RiderStatDto dto, DateTime now)
+    {
+        // Always keep the name fresh in case it changed in the API
+        if (!string.IsNullOrWhiteSpace(dto.RiderName))
+            record.RiderName = dto.RiderName;
+
+        UpdateHours(record, dto.WorkingHours);
+        UpdateOrders(record, dto.Orders);
+
+        record.Wallet = dto.Wallet;
+        record.LastUpdatedAt = now;
+    }
+
+    // ── HOURS ACCUMULATION ─────────────────────────────────────────────────
+    // API sends hours-since-shift-start. When a new shift begins the value
+    // resets to ~0, so a large drop means "commit the completed shift."
+    private static void UpdateHours(RiderStat record, decimal incomingHours)
+    {
+        var drop = record.LastSeenWorkingHours - incomingHours;
+
+        if (drop > HOURS_RESET_THRESHOLD)
+        {
+            // New shift detected: bank the completed shift's hours
+            record.WorkingHoursBase += record.LastSeenWorkingHours;
+        }
+
+        record.LastSeenWorkingHours = incomingHours;
+        record.WorkingHours = record.WorkingHoursBase + incomingHours;
+    }
+
+    // ── ORDERS ACCUMULATION ────────────────────────────────────────────────
+    // Three cases:
+    //  1. Normal increment:    dto.Orders >= LastSeen          → same shift
+    //  2. Drop to zero:        dto.Orders == 0, was > 0        → snapshot, wait
+    //  3. Non-zero drop:       0 < dto.Orders < LastSeen       → new shift confirmed
+    //
+    // "ZeroTicks" lets us absorb a single glitch zero before committing.
+    private static void UpdateOrders(RiderStat record, int incomingOrders)
+    {
+        if (incomingOrders < record.LastSeenOrders)
+        {
+            if (incomingOrders == 0)
+            {
+                // Could be a glitch — snapshot and wait up to GRACE ticks
+                if (record.OrdersSnapshottedBeforeReset == 0)
+                    record.OrdersSnapshottedBeforeReset = record.LastSeenOrders;
+
+                record.LastSeenOrders = 0;
+                // Don't change Orders yet — keep showing last known value
+                return;
+            }
+            else
+            {
+                // Unambiguous drop to non-zero: definitely a new shift
+                CommitCompletedShift(record);
+            }
+        }
+        else if (record.OrdersSnapshottedBeforeReset > 0)
+        {
+            // We were in a "zero grace" window — now resolving it
+            if (incomingOrders > 0 && incomingOrders < record.OrdersSnapshottedBeforeReset)
+            {
+                // Recovered with fewer orders → genuine new shift
+                CommitCompletedShift(record);
+            }
+            else if (incomingOrders >= record.OrdersSnapshottedBeforeReset)
+            {
+                // Recovered at same or higher level → was a glitch, cancel snapshot
+                record.OrdersSnapshottedBeforeReset = 0;
+            }
+            // incomingOrders == 0 again: still in grace, keep waiting
+        }
+
+        record.LastSeenOrders = incomingOrders;
+        record.Orders = record.OrdersBase + incomingOrders;
+    }
+
+    private static void CommitCompletedShift(RiderStat record)
+    {
+        // Bank the highest known value from the completed shift
+        var completedShiftOrders = record.OrdersSnapshottedBeforeReset > 0
+            ? record.OrdersSnapshottedBeforeReset
+            : record.LastSeenOrders;
+
+        record.OrdersBase += completedShiftOrders;
+        record.OrdersSnapshottedBeforeReset = 0;
+    }
+
+    // ── CREATE NEW RECORD ──────────────────────────────────────────────────
+    // Key fix: Orders starts at dto.Orders (not 0) so that riders who are
+    // mid-shift when the extension first sees them are counted correctly.
+    private static RiderStat CreateNew(RiderStatDto dto, DateTime now) => new()
+    {
+        RiderId = dto.RiderId,
+        RiderName = dto.RiderName,
+        CompanyId = dto.CompanyId,
+        Date = dto.Date,
+        Wallet = dto.Wallet,
+
+        // Start from whatever the API reports right now
+        Orders = dto.Orders,
+        OrdersBase = 0,
+        LastSeenOrders = dto.Orders,
+        OrdersSnapshottedBeforeReset = 0,
+
+        // OrdersDayStart kept at 0 — no longer subtracted in UpdateOrders
+        OrdersDayStart = 0,
+
+        WorkingHours = dto.WorkingHours,
+        WorkingHoursBase = 0,
+        LastSeenWorkingHours = dto.WorkingHours,
+
+        LastUpdatedAt = now,
+    };
+
+    // ── READ ENDPOINTS (unchanged logic) ───────────────────────────────────
     public async Task<CompanyDayStats?> GetByCompanyAndDateAsync(
         string companyId, DateOnly date)
     {
         var riders = await db.RiderStats
             .AsNoTracking()
             .Where(r => r.CompanyId == companyId && r.Date == date)
-            .OrderByDescending(r => r.WorkingHours)  
+            .OrderByDescending(r => r.WorkingHours)
             .ToListAsync();
 
-        if (!riders.Any()) return null;
-
-        return BuildStats(companyId, date, riders);
+        return riders.Count == 0 ? null : BuildStats(companyId, date, riders);
     }
 
-    // ── GET SUMMARY (last N days) ──────────────────────────────────────────
     public async Task<IEnumerable<CompanyDayStats>> GetCompanySummaryAsync(
         string companyId, int lastDays = 30)
     {
@@ -148,20 +188,16 @@ public class RiderStatService(ApplicationDbContext db) : IRiderStatService
         var riders = await db.RiderStats
             .AsNoTracking()
             .Where(r => r.CompanyId == companyId && r.Date >= from)
-            .OrderByDescending(r => r.Date)
             .ToListAsync();
 
         return riders
             .GroupBy(r => r.Date)
+            .OrderByDescending(g => g.Key)
             .Select(g => BuildStats(companyId, g.Key, g.ToList()));
     }
 
-    // ── HELPER ─────────────────────────────────────────────────────────────
-    // Reads WorkingHours and Orders directly from DB — they are already
-    // the correct full-day totals thanks to the upsert logic above.
     private static CompanyDayStats BuildStats(
-        string companyId, DateOnly date, IList<RiderStat> riders) =>
-        new(
+        string companyId, DateOnly date, IList<RiderStat> riders) => new(
             companyId,
             date,
             TotalRiders: riders.Count,
@@ -169,13 +205,7 @@ public class RiderStatService(ApplicationDbContext db) : IRiderStatService
             TotalWallet: riders.Sum(r => r.Wallet),
             TotalWorkingHours: riders.Sum(r => r.WorkingHours),
             Riders: riders.Select(r => new RiderStatDto(
-                r.RiderId,
-                r.RiderName,
-                r.CompanyId,
-                r.Date,
-                r.Wallet,
-                r.Orders,
-                r.WorkingHours   // ← already the full-day accumulated total
-            ))
+                r.RiderId, r.RiderName, r.CompanyId, r.Date,
+                r.Wallet, r.Orders, r.WorkingHours))
         );
 }

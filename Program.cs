@@ -27,6 +27,18 @@ builder.Services.ConfigureApplicationCookie(o =>
     o.AccessDeniedPath = "/Account/Login";
 });
 
+builder.Services.AddCors(options =>
+{
+    options.AddPolicy("AllowFrontend",
+        policy =>
+        {
+            policy
+                .AllowAnyOrigin()
+                .AllowAnyHeader()
+                .AllowAnyMethod();
+        });
+});
+
 builder.Services.AddScoped<IRiderStatService, RiderStatService>();
 builder.Services.AddScoped<IExternalProviderService, ExternalProviderService>();
 builder.Services.AddScoped<IRiderNameOverrideService, RiderNameOverrideService>();
@@ -35,6 +47,8 @@ builder.Services.AddScoped<IKeetaStatService, KeetaStatService>();
 builder.Services.AddControllersWithViews();
 
 var app = builder.Build();
+
+app.UseCors("AllowFrontend");
 
 app.UseStaticFiles();
 app.UseRouting();
