@@ -1,6 +1,9 @@
-﻿namespace LiveDahsboard.Models;
+﻿using Microsoft.EntityFrameworkCore;
 
-// Models/RiderShiftStat.cs
+namespace LiveDahsboard.Models;
+
+[Index(nameof(CompanyId), nameof(Date))]
+[Index(nameof(RiderId), nameof(CompanyId), nameof(ActiveShiftStartedAt), IsUnique = true)]
 public class RiderShiftStat
 {
     public int Id { get; set; }

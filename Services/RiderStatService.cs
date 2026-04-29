@@ -11,6 +11,14 @@ public class RiderShiftStatService(ApplicationDbContext db) : IRiderShiftStatSer
     private static readonly TimeZoneInfo SaudiTz =
         TimeZoneInfo.FindSystemTimeZoneById("Arab Standard Time");
 
+    /// <summary>
+    /// Shifts older than this are considered stale / un-reset API data.
+    /// They are silently skipped to prevent hours and orders from inflating.
+    /// 20 h gives a comfortable margin for genuine long shifts while blocking
+    /// multi-day carry-overs.
+    /// </summary>
+    private const int MaxShiftHours = 20;
+
     // ── UPSERT ─────────────────────────────────────────────────────────────
     public async Task UpsertBatchAsync(IEnumerable<RiderShiftStatIncoming> items)
     {
@@ -20,8 +28,11 @@ public class RiderShiftStatService(ApplicationDbContext db) : IRiderShiftStatSer
 
         if (list.Count == 0) return;
 
-        // Each incoming item may produce 1 or 2 DB records (midnight split)
+        // Each incoming item may produce 1 or 2 DB records (midnight split).
+        // Stale shifts (> MaxShiftHours old) are dropped inside BuildSegments.
         var allSegments = list.SelectMany(BuildSegments).ToList();
+
+        if (allSegments.Count == 0) return;
 
         var riderIds = allSegments.Select(s => s.RiderId).Distinct().ToList();
         var companyIds = allSegments.Select(s => s.CompanyId).Distinct().ToList();
@@ -43,8 +54,8 @@ public class RiderShiftStatService(ApplicationDbContext db) : IRiderShiftStatSer
             if (map.TryGetValue(key, out var record))
             {
                 record.RiderName = seg.RiderName;
-                record.Orders = seg.Orders;
-                record.WorkingHours = seg.WorkingHours;
+                record.Orders = seg.Orders;           // split value, not raw total
+                record.WorkingHours = seg.WorkingHours;     // capped / split value
                 record.Wallet = seg.Wallet;
                 record.LastUpdatedAt = now;
             }
@@ -70,24 +81,28 @@ public class RiderShiftStatService(ApplicationDbContext db) : IRiderShiftStatSer
         await db.SaveChangesAsync();
     }
 
-    // ── MIDNIGHT SPLIT LOGIC ───────────────────────────────────────────────
-    // A shift that crosses midnight in UTC+3 is split into two segments:
+    // ── SEGMENT BUILDER ────────────────────────────────────────────────────
     //
-    //   Segment A  →  date of shift start  →  hours from shift start → midnight
-    //   Segment B  →  next date            →  hours from midnight    → now (capped)
+    //  Rules:
+    //  1. Shifts older than MaxShiftHours are silently dropped — stale API data.
+    //  2. Same-day shift → single segment, hours capped to elapsed time.
+    //  3. Midnight-crossing shift → two segments:
+    //       Segment A  date = shift-start date   key = shiftStartUtc
+    //       Segment B  date = today              key = midnightUtc
+    //     Hours are split at the local-midnight boundary and each side is
+    //     independently capped.
+    //     Orders are split PROPORTIONALLY by hours so that today's row only
+    //     counts orders likely completed after midnight, not the whole shift total.
     //
-    // Key rule: if the reported workedSeconds would exceed the time elapsed
-    // since midnight on the CURRENT date, cap it to elapsed time.
-    // This prevents a shift that just started at 11 PM from reporting 2 h
-    // on today's date when only 1 h has actually passed today.
-    //
-    // The shift identity key (ActiveShiftStartedAt) is the SAME for both
-    // segments so that upsert can find and update each date row correctly.
-    // ──────────────────────────────────────────────────────────────────────
     private static IEnumerable<ShiftSegment> BuildSegments(RiderShiftStatIncoming item)
     {
         var shiftStartUtc = item.ActiveShiftStartedAt!.Value;
         var nowUtc = DateTime.UtcNow;
+
+        // ── Guard: drop shifts that are unrealistically old ────────────────
+        if ((nowUtc - shiftStartUtc).TotalHours > MaxShiftHours)
+            yield break;
+
         var totalHours = item.WorkedSeconds / 3600m;
 
         // Convert to Saudi local time (UTC+3)
@@ -102,41 +117,61 @@ public class RiderShiftStatService(ApplicationDbContext db) : IRiderShiftStatSer
         {
             // Cap: can't have worked more hours than have elapsed since shift start
             var elapsedHours = (decimal)(nowUtc - shiftStartUtc).TotalHours;
-            var hoursToday = Math.Min(totalHours, Math.Max(0, elapsedHours));
+            var hoursToday = Math.Min(totalHours, Math.Max(0m, elapsedHours));
 
             yield return new ShiftSegment(
-                item, shiftStartDate, item.ActiveShiftStartedAt!.Value, hoursToday);
+                Source: item,
+                Date: shiftStartDate,
+                ActiveShiftStartedAt: shiftStartUtc,
+                WorkingHours: hoursToday,
+                Orders: item.Orders);   // full orders — all happened today
 
             yield break;
         }
 
         // ── Midnight crossing detected ─────────────────────────────────────
-        // Shift started on a PREVIOUS calendar date (local time).
-        // Split at local midnight between the two dates.
-
-        // midnight that separates the two days (in UTC)
+        // Find the local midnight that separates the two calendar dates.
         var midnightLocal = shiftStartDate.ToDateTime(TimeOnly.MinValue).AddDays(1);
-        // convert that local midnight back to UTC
         var midnightUtc = TimeZoneInfo.ConvertTimeToUtc(midnightLocal, SaudiTz);
 
-        // Hours the rider worked on the START date (before midnight)
+        // Hours the rider worked on the START date (shift-start → midnight)
         var hoursBeforeMidnight = (decimal)(midnightUtc - shiftStartUtc).TotalHours;
-        hoursBeforeMidnight = Math.Max(0, Math.Min(totalHours, hoursBeforeMidnight));
+        hoursBeforeMidnight = Math.Max(0m, Math.Min(totalHours, hoursBeforeMidnight));
 
-        // Hours worked on the NEXT date (after midnight, capped to elapsed time today)
+        // Hours worked on the CURRENT date (midnight → now), capped to elapsed
         var hoursAfterMidnight = totalHours - hoursBeforeMidnight;
         var elapsedTodayHours = (decimal)(nowUtc - midnightUtc).TotalHours;
-        hoursAfterMidnight = Math.Max(0, Math.Min(hoursAfterMidnight, elapsedTodayHours));
+        hoursAfterMidnight = Math.Max(0m, Math.Min(hoursAfterMidnight, elapsedTodayHours));
+
+        // ── Proportional order split ───────────────────────────────────────
+        // We don't know exactly when each order happened, so we use the hours
+        // ratio as the best available proxy.
+        // Edge case: if totalHours rounds to zero, credit all orders to the
+        // start-date segment (the rider barely worked — probably still offline).
+        decimal ratio = totalHours > 0m
+            ? hoursBeforeMidnight / totalHours
+            : 1m;
+
+        int ordersBeforeMidnight = (int)Math.Round(item.Orders * ratio);
+        int ordersAfterMidnight = item.Orders - ordersBeforeMidnight;
 
         // Segment A — previous date, shift identity = original shift start
         yield return new ShiftSegment(
-            item, shiftStartDate, shiftStartUtc, hoursBeforeMidnight);
+            Source: item,
+            Date: shiftStartDate,
+            ActiveShiftStartedAt: shiftStartUtc,
+            WorkingHours: hoursBeforeMidnight,
+            Orders: ordersBeforeMidnight);
 
-        // Segment B — today's date, shift identity = midnight UTC
+        // Segment B — today, shift identity = midnight UTC
         // Using midnight as the key keeps today's segment uniquely identifiable
         // while still being tied to the same physical shift.
         yield return new ShiftSegment(
-            item, todayLocal, midnightUtc, hoursAfterMidnight);
+            Source: item,
+            Date: todayLocal,
+            ActiveShiftStartedAt: midnightUtc,
+            WorkingHours: hoursAfterMidnight,
+            Orders: ordersAfterMidnight);
     }
 
     // ── READ: GET BY COMPANY + DATE ────────────────────────────────────────
@@ -186,16 +221,18 @@ public class RiderShiftStatService(ApplicationDbContext db) : IRiderShiftStatSer
         );
 
     // ── INTERNAL SEGMENT RECORD ────────────────────────────────────────────
+    // Orders is now an explicit parameter — NOT derived from Source.Orders —
+    // so each segment carries only its share of the total.
     private record ShiftSegment(
         RiderShiftStatIncoming Source,
         DateOnly Date,
         DateTime ActiveShiftStartedAt,
-        decimal WorkingHours)
+        decimal WorkingHours,
+        int Orders)
     {
         public string RiderId => Source.RiderId;
         public string RiderName => Source.RiderName;
         public string CompanyId => Source.CompanyId;
-        public int Orders => Source.Orders;
         public decimal Wallet => Source.Wallet;
     }
 }
