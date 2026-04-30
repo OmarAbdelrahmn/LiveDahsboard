@@ -67,7 +67,7 @@ public class KeetaStatService(ApplicationDbContext db) : IKeetaStatService
         var couriers = await db.KeetaStats
             .AsNoTracking()
             .Where(r => r.OrgId == orgId && r.Date == date)
-            .OrderByDescending(r => r.FinishedTasks)
+            .OrderByDescending(r => r.OnlineHours)
             .ToListAsync();
 
         if (!couriers.Any()) return null;

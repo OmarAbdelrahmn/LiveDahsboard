@@ -173,18 +173,43 @@ public class RiderShiftStatService(ApplicationDbContext db) : IRiderShiftStatSer
             WorkingHours: hoursAfterMidnight,
             Orders: ordersAfterMidnight);
     }
-
-    // ── READ: GET BY COMPANY + DATE ────────────────────────────────────────
     public async Task<CompanyDayStats?> GetByCompanyAndDateAsync(
         string companyId, DateOnly date)
     {
-        var shifts = await db.RiderShiftStats
+        // All shifts for this specific day
+        var todayShifts = await db.RiderShiftStats
             .AsNoTracking()
             .Where(r => r.CompanyId == companyId && r.Date == date)
-            .OrderByDescending(r => r.Orders)
             .ToListAsync();
 
-        return shifts.Count == 0 ? null : BuildStats(companyId, date, shifts);
+        // Riders who have ANY record for this company but NOT on this date
+        var presentRiderIds = todayShifts.Select(r => r.RiderId).ToHashSet();
+
+        var missingRiders = await db.RiderShiftStats
+            .AsNoTracking()
+            .Where(r => r.CompanyId == companyId
+                     && r.Date != date
+                     && !presentRiderIds.Contains(r.RiderId))
+            .GroupBy(r => r.RiderId)
+            .Select(g => new RiderShiftStat
+            {
+                RiderId = g.Key,
+                RiderName = g.OrderByDescending(r => r.LastUpdatedAt)
+                             .Select(r => r.RiderName)
+                             .First(),
+                CompanyId = companyId,
+                ActiveShiftStartedAt = DateTime.MinValue,
+                Date = date,
+                Orders = 0,
+                WorkingHours = 0,
+                Wallet = 0,
+                LastUpdatedAt = DateTime.MinValue,
+            })
+            .ToListAsync();
+
+        var allShifts = todayShifts.Concat(missingRiders).ToList();
+
+        return allShifts.Count == 0 ? null : BuildStats(companyId, date, allShifts);
     }
 
     // ── READ: COMPANY SUMMARY (last N days) ────────────────────────────────
