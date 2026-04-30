@@ -207,18 +207,31 @@ public class RiderShiftStatService(ApplicationDbContext db) : IRiderShiftStatSer
 
     // ── BUILD STATS ────────────────────────────────────────────────────────
     private static CompanyDayStats BuildStats(
-        string companyId, DateOnly date, IList<RiderShiftStat> shifts) => new(
+        string companyId, DateOnly date, IList<RiderShiftStat> shifts)
+    {
+        var perRider = shifts
+            .GroupBy(r => r.RiderId)
+            .Select(g => new RiderShiftStatDto(
+                RiderId: g.Key,
+                RiderName: g.First().RiderName,
+                CompanyId: companyId,
+                ActiveShiftStartedAt: g.Min(r => r.ActiveShiftStartedAt),
+                Date: date,
+                Wallet: g.Max(r => r.Wallet),
+                Orders: g.Max(r => r.Orders),   // ← Max, not Sum
+                WorkingHours: g.Sum(r => r.WorkingHours))) // ← Sum is correct
+            .OrderByDescending(r => r.Orders)
+            .ToList();
+
+        return new CompanyDayStats(
             companyId,
             date,
-            TotalRiders: shifts.Select(r => r.RiderId).Distinct().Count(),
-            TotalOrders: shifts.Sum(r => r.Orders),
-            TotalWallet: shifts.Sum(r => r.Wallet),
-            TotalWorkingHours: shifts.Sum(r => r.WorkingHours),
-            Riders: shifts.Select(r => new RiderShiftStatDto(
-                r.RiderId, r.RiderName, r.CompanyId,
-                r.ActiveShiftStartedAt, r.Date,
-                r.Wallet, r.Orders, r.WorkingHours))
-        );
+            TotalRiders: perRider.Count,
+            TotalOrders: perRider.Sum(r => r.Orders),
+            TotalWallet: perRider.Sum(r => r.Wallet),
+            TotalWorkingHours: perRider.Sum(r => r.WorkingHours),
+            Riders: perRider);
+    }
 
     // ── INTERNAL SEGMENT RECORD ────────────────────────────────────────────
     // Orders is now an explicit parameter — NOT derived from Source.Orders —
