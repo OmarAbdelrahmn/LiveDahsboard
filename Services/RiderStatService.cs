@@ -180,27 +180,32 @@ public class RiderShiftStatService(ApplicationDbContext db) : IRiderShiftStatSer
     public async Task<CompanyDayStats?> GetByCompanyAndDateAsync(
         string companyId, DateOnly date)
     {
-        // All shifts for this specific day
+        // ── Step 1: shifts that exist for the requested date ──────────────────
         var todayShifts = await db.RiderShiftStats
             .AsNoTracking()
             .Where(r => r.CompanyId == companyId && r.Date == date)
             .ToListAsync();
 
-        // Riders who have ANY record for this company but NOT on this date
         var presentRiderIds = todayShifts.Select(r => r.RiderId).ToHashSet();
 
-        var missingRiders = await db.RiderShiftStats
+        // ── Step 2: raw rows for riders with NO record on this date ───────────
+        // Pull rows into memory first — EF Core cannot translate
+        // OrderByDescending(...).First() inside a GroupBy projection to SQL.
+        var missingRiderRows = await db.RiderShiftStats
             .AsNoTracking()
             .Where(r => r.CompanyId == companyId
                      && r.Date != date
                      && !presentRiderIds.Contains(r.RiderId))
+            .ToListAsync();   // ← evaluate in DB, group in memory below
+
+        // ── Step 3: collapse to one zero-stat placeholder per missing rider ───
+        var missingRiders = missingRiderRows
             .GroupBy(r => r.RiderId)
             .Select(g => new RiderShiftStat
             {
                 RiderId = g.Key,
                 RiderName = g.OrderByDescending(r => r.LastUpdatedAt)
-                                        .Select(r => r.RiderName)
-                                        .First(),
+                                        .First().RiderName,   // safe in-memory
                 CompanyId = companyId,
                 ActiveShiftStartedAt = DateTime.MinValue,
                 Date = date,
@@ -209,7 +214,7 @@ public class RiderShiftStatService(ApplicationDbContext db) : IRiderShiftStatSer
                 Wallet = 0,
                 LastUpdatedAt = DateTime.MinValue,
             })
-            .ToListAsync();
+            .ToList();
 
         var allShifts = todayShifts.Concat(missingRiders).ToList();
 
