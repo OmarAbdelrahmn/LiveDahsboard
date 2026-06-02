@@ -14,4 +14,10 @@ public class ApplicationDbContext(DbContextOptions<ApplicationDbContext> options
 
     public DbSet<RiderShiftStat> RiderShiftStats { get; set; }
 
+    /// <summary>
+    /// Append-only snapshot log — one row per rider per poll.
+    /// Replaces RiderShiftStats.
+    /// </summary>
+    public DbSet<RiderSnapshot> RiderSnapshots { get; set; }
+
 }
