@@ -39,10 +39,11 @@ builder.Services.AddCors(options =>
         });
 });
 
-builder.Services.AddScoped<IRiderShiftStatService, RiderShiftStatService>();
+//builder.Services.AddScoped<IRiderShiftStatService, RiderShiftStatService>();
 builder.Services.AddScoped<IExternalProviderService, ExternalProviderService>();
 builder.Services.AddScoped<IRiderNameOverrideService, RiderNameOverrideService>();
 builder.Services.AddScoped<IKeetaStatService, KeetaStatService>();
+builder.Services.AddScoped<IRiderSnapshotService, RiderSnapshotService>();
 
 builder.Services.AddControllersWithViews();
 
