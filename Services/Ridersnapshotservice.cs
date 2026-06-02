@@ -23,7 +23,7 @@ public interface IRiderSnapshotService
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// INCOMING DTO  (what the front-end / controller hands us)
+// INCOMING DTO
 // ─────────────────────────────────────────────────────────────────────────────
 
 public record RiderSnapshotIncoming(
@@ -31,7 +31,8 @@ public record RiderSnapshotIncoming(
     string RiderName,
     string CompanyId,
     int Orders,
-    /// <summary>Raw seconds from the API — converted to hours on the way in.</summary>
+    /// <summary>Raw seconds from the API — kept for potential future use but
+    /// working hours are now derived from snapshot timestamps instead.</summary>
     decimal WorkedSeconds,
     decimal Wallet);
 
@@ -53,22 +54,36 @@ public class RiderSnapshotService(ApplicationDbContext db) : IRiderSnapshotServi
     private static DateOnly TodayLocal() =>
         DateOnly.FromDateTime(ToLocal(NowUtc));
 
-    // ── Reset-detection thresholds ────────────────────────────────────────────
+    // ── Orders reset-detection threshold ─────────────────────────────────────
+    private const int OrdersResetThreshold = 1;
+
+    // ── Active-time gap threshold ─────────────────────────────────────────────
     //
-    // A "session reset" is when the API's cumulative counter drops, meaning the
-    // rider started a brand-new shift.  We treat any drop above these thresholds
-    // as a reset so that normal floating-point jitter is ignored.
+    // Snapshots are pushed every 30 seconds.  If two consecutive snapshots are
+    // more than this many seconds apart we treat the gap as a break / offline
+    // period and do NOT count it toward working hours.
     //
-    private const decimal HoursResetThreshold = 0.05m;   // ~3 minutes
-    private const int OrdersResetThreshold = 1;           // any order decrease
+    // 300 s (5 min) gives enough headroom for a missed poll or a brief
+    // network hiccup without accidentally crediting a long break as work time.
+    //
+    private const double ActiveGapThresholdSeconds = 300.0;
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // WRITE — just append, no heuristics
+    // WRITE
     // ═══════════════════════════════════════════════════════════════════════════
 
     public async Task InsertBatchAsync(IEnumerable<RiderSnapshotIncoming> items)
     {
         var now = NowUtc;
+
+        // ── Midnight-split logic ──────────────────────────────────────────────
+        //
+        // Converting to local time here means a rider whose shift crosses
+        // midnight gets their pre-midnight snapshots stamped with Day 1 and
+        // their post-midnight snapshots stamped with Day 2.  The working-hours
+        // algorithm in BuildStats then naturally produces correct per-day totals
+        // because it only ever sees snapshots for a single calendar date.
+        //
         var today = DateOnly.FromDateTime(ToLocal(now));
 
         var snapshots = items.Select(item => new RiderSnapshot
@@ -79,7 +94,11 @@ public class RiderSnapshotService(ApplicationDbContext db) : IRiderSnapshotServi
             Date = today,
             RecordedAtUtc = now,
             Orders = item.Orders,
-            WorkingHours = Math.Max(0m, item.WorkedSeconds / 3600m),
+
+            // WorkingHours stored here is kept as 0 — the real calculation
+            // happens in BuildStats from the RecordedAtUtc timestamps.
+            WorkingHours = 0m,
+
             Wallet = item.Wallet,
         }).ToList();
 
@@ -131,34 +150,31 @@ public class RiderSnapshotService(ApplicationDbContext db) : IRiderSnapshotServi
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // BUILD STATS  — the masterpiece
+    // BUILD STATS
     // ═══════════════════════════════════════════════════════════════════════════
     //
-    //  How working hours and orders are derived
-    //  ─────────────────────────────────────────
-    //  The API sends CUMULATIVE counters for the rider's current shift.
-    //  When a new shift starts (end-of-shift, app restart, midnight, etc.)
-    //  those counters reset to a low value.
+    //  Working-hours derivation (timestamp-based)
+    //  ──────────────────────────────────────────
+    //  Because the API's worked-seconds counter is unreliable (always 0), hours
+    //  are computed from the RecordedAtUtc timestamps instead.
     //
-    //  Algorithm per rider:
-    //    1. Sort snapshots chronologically.
-    //    2. Walk the series; detect a "session reset" whenever the current
-    //       value drops below the previous value by more than the threshold.
-    //    3. Each session's contribution = last_value − first_value.
-    //       • Same-day start  → first ≈ 0, contribution ≈ last_value.
-    //       • Midnight carry-over → first is yesterday's carry, contribution
-    //         = only the hours/orders accumulated on THIS date.
-    //       • Multiple shifts in one day → each shift is its own session;
-    //         contributions are summed.
-    //    4. Total = Σ session contributions.
+    //  Algorithm per rider (single calendar date):
+    //    1. Sort snapshots by RecordedAtUtc.
+    //    2. Walk consecutive pairs (t_i, t_{i+1}).
+    //    3. If the gap ≤ ActiveGapThresholdSeconds → rider was active; add it.
+    //       If the gap  > threshold                → break / offline; skip it.
+    //    4. Total active seconds ÷ 3 600 = working hours for this date.
     //
-    //  Example timeline for one rider:
-    //    08:00  hours=0.10  orders=0   ← shift 1 starts
-    //    09:00  hours=1.05  orders=3
-    //    10:00  hours=2.02  orders=7   ← shift 1 ends   contribution: 2.02−0.10 = 1.92h / 7 orders
-    //    10:30  hours=0.08  orders=0   ← shift 2 starts (reset detected)
-    //    12:00  hours=1.55  orders=5                    contribution: 1.55−0.08 = 1.47h / 5 orders
-    //    Total: 3.39 h  /  12 orders
+    //  Midnight-crossing shifts
+    //  ─────────────────────────
+    //  InsertBatchAsync stamps Date using the local Saudi time, so a rider
+    //  working 22:00 → 03:00 produces:
+    //    • Day 1 snapshots: 22:00 – 23:59  →  ≈ 2 h counted for Day 1
+    //    • Day 2 snapshots: 00:00 – 03:00  →  ≈ 3 h counted for Day 2
+    //  The 30-second gap at the boundary is silently dropped — negligible.
+    //
+    //  Example (rider, single day 00:00 – 03:00, 30-s polling):
+    //    360 consecutive 30-second gaps × 30 s = 10 800 s = 3.00 h  ✓
     //
     private static CompanyDayStats BuildStats(
         string companyId, DateOnly date, IList<RiderSnapshot> snapshots)
@@ -167,14 +183,12 @@ public class RiderSnapshotService(ApplicationDbContext db) : IRiderSnapshotServi
             .GroupBy(r => r.RiderId)
             .Select(g =>
             {
-                // Snapshots are already ordered by RecordedAtUtc from the query,
-                // but re-sort here in case this method is called with arbitrary data.
                 var ordered = g.OrderBy(r => r.RecordedAtUtc).ToList();
 
-                decimal totalHours = SumSessions(
-                    ordered.Select(r => r.WorkingHours).ToList(),
-                    HoursResetThreshold);
+                // ── Hours: derived from timestamps, NOT the stored counter ──
+                decimal totalHours = ComputeActiveHours(ordered);
 
+                // ── Orders: still uses the cumulative-counter + reset logic ──
                 int totalOrders = (int)SumSessions(
                     ordered.Select(r => (decimal)r.Orders).ToList(),
                     OrdersResetThreshold);
@@ -184,12 +198,12 @@ public class RiderSnapshotService(ApplicationDbContext db) : IRiderSnapshotServi
 
                 return new RiderSnapshotDto(
                     RiderId: g.Key,
-                    RiderName: last.RiderName,       // use latest name in case of override
+                    RiderName: last.RiderName,
                     CompanyId: companyId,
                     Date: date,
-                    Wallet: last.Wallet,             // latest balance snapshot
+                    Wallet: last.Wallet,
                     Orders: totalOrders,
-                    WorkingHours: Math.Round(totalHours, 1),
+                    WorkingHours: totalHours,
                     FirstSeenAt: first.RecordedAtUtc,
                     LastSeenAt: last.RecordedAtUtc);
             })
@@ -207,25 +221,43 @@ public class RiderSnapshotService(ApplicationDbContext db) : IRiderSnapshotServi
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // SESSION SUM — core algorithm
+    // COMPUTE ACTIVE HOURS  — timestamp-based working time
     // ═══════════════════════════════════════════════════════════════════════════
     //
-    //  Walks an ordered series of cumulative values and returns the total
-    //  NET increase across all sessions (resetting whenever the value drops).
+    //  Sums every consecutive snapshot gap that falls within the active
+    //  threshold.  Gaps above the threshold (breaks, offline, midnight boundary)
+    //  are silently skipped.
     //
-    //  Parameters
-    //  ──────────
-    //  values         Chronologically ordered cumulative readings.
-    //  resetThreshold Any drop ≥ this is treated as a new session start.
-    //                 Smaller drops are considered noise and ignored.
+    //  Edge cases:
+    //    • 0 snapshots  → 0 h  (nothing to measure)
+    //    • 1 snapshot   → 0 h  (a single point has no duration)
+    //    • All gaps > threshold  → 0 h  (rider was polled once, then disappeared)
     //
+    private static decimal ComputeActiveHours(IList<RiderSnapshot> ordered)
+    {
+        if (ordered.Count < 2) return 0m;
+
+        double totalSeconds = 0;
+
+        for (int i = 1; i < ordered.Count; i++)
+        {
+            double gap = (ordered[i].RecordedAtUtc - ordered[i - 1].RecordedAtUtc)
+                         .TotalSeconds;
+
+            if (gap <= ActiveGapThresholdSeconds)
+                totalSeconds += gap;
+        }
+
+        return Math.Round((decimal)(totalSeconds / 3600.0), 2);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // SESSION SUM — used for orders only
+    // ═══════════════════════════════════════════════════════════════════════════
+
     private static decimal SumSessions(IList<decimal> values, decimal resetThreshold)
     {
         if (values.Count == 0) return 0m;
-
-        // A single snapshot → just return its value directly.
-        // There's no "previous" to subtract, so the API value IS the total
-        // for this session (which started at some point before we began recording).
         if (values.Count == 1) return Math.Max(0m, values[0]);
 
         decimal total = 0m;
@@ -235,29 +267,21 @@ public class RiderSnapshotService(ApplicationDbContext db) : IRiderSnapshotServi
         for (int i = 1; i < values.Count; i++)
         {
             decimal current = values[i];
-
             bool resetDetected = prev - current >= resetThreshold;
 
             if (resetDetected)
             {
-                // Close the current session: add what accumulated up to the last
-                // reading before the reset.
                 total += Math.Max(0m, prev - sessionStart);
-
-                // New session begins at the current (post-reset) value.
                 sessionStart = current;
             }
 
             prev = current;
         }
 
-        // Close the final (open) session.
         total += Math.Max(0m, prev - sessionStart);
-
         return total;
     }
 }
-
 
 /// <summary>Per-rider stats derived from raw snapshots for a single day.</summary>
 public record RiderSnapshotDto(
@@ -268,9 +292,7 @@ public record RiderSnapshotDto(
     decimal Wallet,
     int Orders,
     decimal WorkingHours,
-    /// <summary>UTC time of the first snapshot recorded today for this rider.</summary>
     DateTime FirstSeenAt,
-    /// <summary>UTC time of the most recent snapshot recorded today for this rider.</summary>
     DateTime LastSeenAt);
 
 /// <summary>Aggregated company-level stats for a single day, with per-rider breakdown.</summary>
