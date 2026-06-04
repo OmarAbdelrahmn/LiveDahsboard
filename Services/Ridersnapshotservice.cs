@@ -34,7 +34,8 @@ public record RiderSnapshotIncoming(
     /// <summary>Raw seconds from the API — kept for potential future use but
     /// working hours are now derived from snapshot timestamps instead.</summary>
     decimal WorkedSeconds,
-    decimal Wallet);
+    decimal Wallet,
+    string Status = "");
 
 // ─────────────────────────────────────────────────────────────────────────────
 // SERVICE
@@ -86,7 +87,14 @@ public class RiderSnapshotService(ApplicationDbContext db) : IRiderSnapshotServi
         //
         var today = DateOnly.FromDateTime(ToLocal(now));
 
-        var snapshots = items.Select(item => new RiderSnapshot
+        var activestatuses = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "working"
+        };
+
+        var snapshots = items
+            .Where(items => activestatuses.Contains(items.Status))
+            .Select(item => new RiderSnapshot
         {
             RiderId = item.RiderId,
             RiderName = item.RiderName,
